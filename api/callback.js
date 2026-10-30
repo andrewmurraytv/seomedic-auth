@@ -22,7 +22,8 @@ export default async function handler(req, res) {
   // One use: clear the binding cookie whatever happens next.
   res.setHeader('Set-Cookie', cookie(BIND_COOKIE, '', { path: '/api/callback', maxAge: 0 }));
 
-  if (!verified || typeof verified.site_url !== 'string') {
+  // p: a confirm-page token is signed with the same key; it must never pass as state.
+  if (!verified || verified.p !== 'state' || typeof verified.site_url !== 'string') {
     return sendErrorPage(res, 400, 'This connection request is invalid or has expired (they last 10 minutes). Start again from SEOMedic → Settings.');
   }
   if (!bind || !safeEqual(sha256Hex(bind), String(verified.b || ''))) {

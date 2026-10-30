@@ -6,7 +6,7 @@
  *  - a hand-built Google URL with an unsigned state pointing at an attacker;
  *  - an attacker confirming with THEIR site, then sending the resulting
  *    (validly signed) Google link to a victim — must fail in the victim's browser;
- *  - a cross-site auto-POST trying to skip the confirmation page;
+ *  - a cross-site auto-POST trying to skip the confirmation page (Origin check);
  *  - site_url values that aren't a WordPress SEOMedic settings page.
  * And the normal flow must still deliver tokens exactly as installed plugins expect.
  */
@@ -35,6 +35,7 @@ const cookiesFrom = (res) => [].concat(res.headers['set-cookie'] || []).map(c =>
 const SITE = 'https://victim.example/wp-admin/admin.php?page=seomedic-settings';
 const EVIL = 'https://evil.example/wp-admin/admin.php?page=seomedic-settings';
 const NONCE = 'a'.repeat(32);
+const SELF = { host: 'seomedic-auth.vercel.app', origin: 'https://seomedic-auth.vercel.app' };
 
 /** Walk the real flow in one "browser": GET confirm page → POST confirm → Google URL. */
 function startFlow(siteUrl) {
@@ -42,7 +43,8 @@ function startFlow(siteUrl) {
   connect({ method: 'GET', query: { site_url: siteUrl, state: NONCE }, headers: {} }, page);
   const csrf = /name="csrf" value="([^"]+)"/.exec(page.body)?.[1];
   const post = mockRes();
-  connect({ method: 'POST', query: {}, headers: { cookie: cookiesFrom(page) }, body: { site_url: siteUrl, state: NONCE, csrf } }, post);
+  // No cookie from the confirm page: Safari withholds them, which is what broke the first version.
+  connect({ method: 'POST', query: {}, headers: { ...SELF }, body: { site_url: siteUrl, state: NONCE, csrf } }, post);
   const state = new URL(post.location).searchParams.get('state');
   return { page, post, state, bindCookie: cookiesFrom(post) };
 }
@@ -105,11 +107,50 @@ test('ATTACK: Google error path is no longer an open redirect', async () => {
   assert.equal(res.location, undefined);
 });
 
-test('ATTACK: cross-site auto-POST without the Strict CSRF cookie cannot skip confirmation', () => {
+/** A real confirm token for EVIL, as an attacker could fetch server-side. */
+function tokenFor(siteUrl) {
+  const page = mockRes();
+  connect({ method: 'GET', query: { site_url: siteUrl, state: NONCE }, headers: {} }, page);
+  return /name="csrf" value="([^"]+)"/.exec(page.body)[1];
+}
+
+test('ATTACK: cross-site auto-POST is refused even with a valid token', () => {
+  const body = { site_url: EVIL, state: NONCE, csrf: tokenFor(EVIL) };
+  for (const headers of [
+    { host: SELF.host, origin: 'https://evil.example' },
+    { host: SELF.host, origin: 'null' },
+    { host: SELF.host },                                         // no Origin, no Referer
+    { host: SELF.host, referer: 'https://evil.example/page' },
+  ]) {
+    const res = mockRes();
+    connect({ method: 'POST', query: {}, headers, body }, res);
+    assert.equal(res.statusCode, 403, JSON.stringify(headers));
+    assert.equal(res.location, undefined);
+  }
+});
+
+test('same-origin Referer is accepted when Origin is absent', () => {
   const res = mockRes();
-  connect({ method: 'POST', query: {}, headers: {}, body: { site_url: EVIL, state: NONCE, csrf: 'guess' } }, res);
-  assert.equal(res.statusCode, 403);
-  assert.equal(res.location, undefined);
+  connect({ method: 'POST', query: {}, headers: { host: SELF.host, referer: 'https://seomedic-auth.vercel.app/api/connect?x=1' },
+    body: { site_url: SITE, state: NONCE, csrf: tokenFor(SITE) } }, res);
+  assert.equal(res.statusCode, 303);
+});
+
+test('confirm token is bound to its site_url and nonce, and is not a state', async () => {
+  const res = mockRes();
+  connect({ method: 'POST', query: {}, headers: { ...SELF }, body: { site_url: EVIL, state: NONCE, csrf: tokenFor(SITE) } }, res);
+  assert.equal(res.statusCode, 403, 'token for SITE reused for EVIL');
+  const cb = mockRes();
+  await callback({ query: { code: 'c', state: tokenFor(SITE) }, headers: {} }, cb);
+  assert.equal(cb.statusCode, 400, 'confirm token accepted as OAuth state');
+});
+
+test('reloading the confirm page does not invalidate the first copy', () => {
+  const first = tokenFor(SITE);
+  tokenFor(SITE); // second load, e.g. a reload or browser prefetch
+  const res = mockRes();
+  connect({ method: 'POST', query: {}, headers: { ...SELF }, body: { site_url: SITE, state: NONCE, csrf: first } }, res);
+  assert.equal(res.statusCode, 303);
 });
 
 test('expired state is rejected', () => {

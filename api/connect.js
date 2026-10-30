@@ -11,8 +11,8 @@
  * site_url + state) is unchanged, so existing installs need no update.
  */
 import {
-  BIND_COOKIE, CSRF_COOKIE, bodyObject, cookie, escapeHtml, htmlHeaders, page,
-  parseCookies, randomToken, safeEqual, sendErrorPage, sha256Hex, signState,
+  BIND_COOKIE, bodyObject, cookie, escapeHtml, htmlHeaders, isSameOriginPost, page,
+  randomToken, sendErrorPage, sha256Hex, signState, verifyState,
   validNonce, validateSiteUrl, isInsecureSiteUrl,
 } from '../lib/security.js';
 
@@ -35,11 +35,10 @@ function confirmPage(req, res) {
     return sendErrorPage(res, 400, 'This connection link is invalid. Start again from SEOMedic → Settings in your WordPress admin.');
   }
   const host = new URL(siteUrl).host;
-  // Double-submit token: SameSite=Strict cookie + hidden field. A page on
-  // another site can auto-submit a POST here, but the browser won't send a
-  // Strict cookie with it, so the confirmation can't be skipped.
-  const csrf = randomToken(16);
-  res.setHeader('Set-Cookie', cookie(CSRF_COOKIE, csrf, { path: '/api/connect', sameSite: 'Strict' }));
+  // Stateless: proves this page rendered the form for exactly this site and
+  // nonce, recently. Reloading the page (or a browser prefetch) can't
+  // invalidate it the way a per-render cookie did.
+  const csrf = signState({ p: 'confirm', site_url: siteUrl, nonce });
   htmlHeaders(res);
   return res.status(200).send(page('Connect Google Search Console', `
 <p>You're about to give this WordPress site read-only access to your Google Search Console data:</p>
@@ -50,32 +49,34 @@ ${isInsecureSiteUrl(siteUrl) ? '<div class="warn"><strong>This site\'s admin isn
   <input type="hidden" name="site_url" value="${escapeHtml(siteUrl)}">
   <input type="hidden" name="state" value="${escapeHtml(nonce)}">
   <input type="hidden" name="csrf" value="${escapeHtml(csrf)}">
-  <button type="submit">Continue to Google</button>
+  <button type="submit">Continue to Google sign-in</button>
 </form>
 <p><small>Access is read-only (Search Console data). You can disconnect at any time from SEOMedic → Settings.</small></p>`));
 }
 
 function confirmed(req, res, proxyBase) {
-  const body = bodyObject(req);
-  const cookies = parseCookies(req.headers.cookie);
-  if (!safeEqual(String(body.csrf || ''), String(cookies[CSRF_COOKIE] || ''))) {
-    return sendErrorPage(res, 403, 'This confirmation expired or came from another page. Start again from SEOMedic → Settings.');
+  // Another site can auto-submit a form here; it can't make the browser
+  // claim this proxy as the Origin.
+  if (!isSameOriginPost(req)) {
+    return sendErrorPage(res, 403, 'This confirmation came from another page. Start again from SEOMedic → Settings.');
   }
+  const body = bodyObject(req);
   const siteUrl = validateSiteUrl(body.site_url);
   const nonce = validNonce(body.state);
   if (!siteUrl || !nonce) {
     return sendErrorPage(res, 400, 'This connection link is invalid. Start again from SEOMedic → Settings in your WordPress admin.');
   }
+  const confirm = verifyState(String(body.csrf || ''));
+  if (!confirm || confirm.p !== 'confirm' || confirm.site_url !== siteUrl || confirm.nonce !== nonce) {
+    return sendErrorPage(res, 403, 'This confirmation expired (they last 10 minutes). Start again from SEOMedic → Settings.');
+  }
 
   // Bind the flow to this browser: the callback only accepts a state whose
   // hash matches this cookie.
   const bind = randomToken(16);
-  const state = signState({ site_url: siteUrl, nonce, b: sha256Hex(bind) });
+  const state = signState({ p: 'state', site_url: siteUrl, nonce, b: sha256Hex(bind) });
 
-  res.setHeader('Set-Cookie', [
-    cookie(BIND_COOKIE, bind, { path: '/api/callback', sameSite: 'Lax' }),
-    cookie(CSRF_COOKIE, '', { path: '/api/connect', maxAge: 0, sameSite: 'Strict' }),
-  ]);
+  res.setHeader('Set-Cookie', cookie(BIND_COOKIE, bind, { path: '/api/callback', sameSite: 'Lax' }));
 
   const params = new URLSearchParams({
     client_id:     process.env.GOOGLE_CLIENT_ID,
