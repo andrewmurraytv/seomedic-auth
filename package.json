@@ -3,6 +3,9 @@
   "version": "1.0.0",
   "description": "OAuth proxy for SEOMedic Google Search Console integration",
   "private": true,
+  "scripts": {
+    "test": "node --test --no-warnings tests/*.test.mjs"
+  },
   "engines": {
     "node": ">=18"
   }
