@@ -59,6 +59,12 @@ test('confirmation page names the destination host and is not framable', () => {
   assert.match(page.headers['content-security-policy'], /frame-ancestors 'none'/);
 });
 
+test('CSP lets the confirm form redirect on to Google (form-action covers redirects)', () => {
+  const { page, post } = startFlow(SITE);
+  const formAction = /form-action ([^;]+)/.exec(page.headers['content-security-policy'])[1].split(' ');
+  assert.ok(formAction.includes(new URL(post.location).origin), formAction.join(' '));
+});
+
 test('happy path: same browser gets tokens in the format plugins expect', async () => {
   const { post, state, bindCookie } = startFlow(SITE);
   assert.equal(post.statusCode, 303);
